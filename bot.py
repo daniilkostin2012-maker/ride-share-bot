@@ -1,9 +1,9 @@
 import logging
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
-
+import os
+TOKEN = os.getenv("TELEGRAM_TOKEN")
 # Вставь сюда свой токен от BotFather
-TOKEN = "8305341712:AAFCA20rATrwpofTXT-l2IPG7H727MTP5Ug"
 
 # Включим логирование (чтобы видеть ошибки)
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
