@@ -1,7 +1,8 @@
+import os
 import logging
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
-import os
+
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 # Вставь сюда свой токен от BotFather
 
