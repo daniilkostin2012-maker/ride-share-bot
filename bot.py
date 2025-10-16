@@ -4,14 +4,16 @@ import sqlite3
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
+# Настройка логов
 logging.basicConfig(level=logging.INFO)
 
+# Получаем переменные окружения
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 PORT = int(os.getenv("PORT", "10000"))
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # Например: https://ride-share-bot.onrender.com
 
 if not TOKEN or not WEBHOOK_URL:
-    raise ValueError("TELEGRAM_TOKEN и WEBHOOK_URL должны быть заданы!")
+    raise RuntimeError("❌ Переменные TELEGRAM_TOKEN и WEBHOOK_URL обязательны!")
 
 # === База данных ===
 def init_db():
@@ -31,9 +33,14 @@ def save_role(user_id, role):
     conn.commit()
     conn.close()
 
-# === Обработчики ===
+# === Обработчики команд ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Привет! Выберите роль: /driver или /passenger")
+    await update.message.reply_text(
+        "Привет! 👋\n"
+        "Выберите роль:\n"
+        "→ /driver — водитель\n"
+        "→ /passenger — пассажир"
+    )
 
 async def driver(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_role(update.effective_user.id, "driver")
@@ -43,22 +50,24 @@ async def passenger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_role(update.effective_user.id, "passenger")
     await update.message.reply_text("Вы — пассажир. 🧑‍💼")
 
-# === Запуск ===
+# === Запуск бота с webhook ===
 def main():
     init_db()
     app = Application.builder().token(TOKEN).build()
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("driver", driver))
     app.add_handler(CommandHandler("passenger", passenger))
 
-    webhook_full_url = f"{WEBHOOK_URL}/{TOKEN}"
+    full_webhook_url = f"{WEBHOOK_URL}/{TOKEN}"
+    logging.info(f"📡 Устанавливаю webhook: {full_webhook_url}")
+
     app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
-        webhook_url=webhook_full_url,
+        webhook_url=full_webhook_url,
         url_path=TOKEN
     )
-    logging.info(f"Бот запущен. Webhook: {webhook_full_url}")
 
 if __name__ == '__main__':
     main()
