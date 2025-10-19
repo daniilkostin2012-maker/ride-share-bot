@@ -692,40 +692,42 @@ async def handle_accept_reject(update: Update, context: ContextTypes.DEFAULT_TYP
         available_seats = c.fetchone()[0]
 
         if req_seats <= available_seats:
-            # --- Отправка контакта водителя водителю (как раньше) ---
-            # Получаем информацию о водителе
-            driver_user = await context.bot.get_chat(query.from_user.id)
-            driver_contact_sent = False
-            if driver_user.username:
-                 # Отправляем сообщение с @username
-                 await context.bot.send_message(
-                     chat_id=query.from_user.id,
-                     text=f"Контакт пассажира:\n@{driver_user.username}"
-                 )
-                 driver_contact_sent = True
-            if not driver_contact_sent:
-                 # Если username нет, отправляем имя
-                 await context.bot.send_contact(
-                     chat_id=query.from_user.id,
-                     phone_number="Нет номера", # Telegram может не предоставить номер
-                     first_name=driver_user.first_name
-                 )
-
-            await query.edit_message_text("Вы приняли пассажира!")
-
-            # --- Отправка информации о водителе пассажиру ---
+            # --- Отправка контакта ПАССАЖИРА водителю ---
             # Получаем информацию о пассажире
             passenger_user = await context.bot.get_chat(passenger_id)
 
-            # Отправляем сообщение пассажиру с @username водителя или его именем
-            if driver_user.username:
-                contact_info = f"@{driver_user.username}"
+            # Отправляем сообщение водителю с @username пассажира или его именем
+            if passenger_user.username:
+                contact_info = f"@{passenger_user.username}"
             else:
-                contact_info = driver_user.first_name
+                contact_info = passenger_user.first_name
 
             await context.bot.send_message(
-                chat_id=passenger_id,
-                text=f"Водитель согласился! Свяжитесь с ним: {contact_info}"
+                chat_id=query.from_user.id, # ID водителя
+                text=f"Контакт пассажира: {contact_info}"
+            )
+            # Альтернатива: отправить контакт (с номером, если есть, или именем)
+            # await context.bot.send_contact(
+            #     chat_id=query.from_user.id,
+            #     phone_number=passenger_user.username or "Нет username", # Telegram может не предоставить номер
+            #     first_name=passenger_user.first_name
+            # )
+
+            await query.edit_message_text("Вы приняли пассажира!")
+
+            # --- Отправка информации о ВОДИТЕЛЕ пассажиру ---
+            # Получаем информацию о водителе
+            driver_user = await context.bot.get_chat(query.from_user.id)
+
+            # Отправляем сообщение пассажиру с @username водителя или его именем
+            if driver_user.username:
+                contact_info_driver = f"@{driver_user.username}"
+            else:
+                contact_info_driver = driver_user.first_name
+
+            await context.bot.send_message(
+                chat_id=passenger_id, # ID пассажира
+                text=f"Водитель согласился! Свяжитесь с ним: {contact_info_driver}"
             )
 
             # Задать вопрос о договоренности
@@ -735,7 +737,7 @@ async def handle_accept_reject(update: Update, context: ContextTypes.DEFAULT_TYP
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
             await context.bot.send_message(
-                chat_id=query.from_user.id,
+                chat_id=query.from_user.id, # ID водителя
                 text="Договорились с пассажиром?",
                 reply_markup=reply_markup
             )
@@ -744,7 +746,7 @@ async def handle_accept_reject(update: Update, context: ContextTypes.DEFAULT_TYP
     elif action == 'reject':
         await query.edit_message_text("Вы отказались от пассажира.")
         await context.bot.send_message(
-            chat_id=passenger_id,
+            chat_id=passenger_id, # ID пассажира
             text="Вас отказались везти."
         )
         # Удаляем запрос, если он не нужен после отказа
