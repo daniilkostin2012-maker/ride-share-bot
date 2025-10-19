@@ -1,399 +1,790 @@
-import os
+# bot.py
 import logging
+import os
 import sqlite3
-import re
-import requests
 from datetime import datetime, timedelta
-from urllib.parse import quote
-from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    ReplyKeyboardRemove, MenuButtonCommands, BotCommand
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    ContextTypes, filters
+    Application,
+    CommandHandler,
+    ContextTypes,
+    ConversationHandler,
+    MessageHandler,
+    filters,
+    CallbackQueryHandler,
 )
 from geopy.distance import geodesic
 import polyline
+import requests # Добавлено для API ORS
 
-# === Настройка ===
-logging.basicConfig(level=logging.INFO)
+# --- Настройки ---
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN") # Получить из переменных окружения на Render
+ORS_API_KEY = os.environ.get("ORS_API_KEY") # Получить из переменных окружения на Render
+DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///carpool_bot.db") # Пример для PostgreSQL на Render
 
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-PORT = int(os.getenv("PORT", "10000"))
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-ORS_API_KEY = os.getenv("ORS_API_KEY")
+# --- Фиксированные координаты склада ---
+# Адрес: Россия, город Омск, ул. Айвазовского, 33
+WAREHOUSE_LAT = 55.001957853274014
+WAREHOUSE_LON = 73.17325327166235
+WAREHOUSE_POINT = [WAREHOUSE_LAT, WAREHOUSE_LON] # [lat, lon]
 
-# Координаты склада: [долгота, широта]
-WAREHOUSE_COORDS = [73.17325327166235, 55.001957853274014]  # ЗАМЕНИ НА СВОИ!
+# --- Состояния для ConversationHandler ---
+ASK_ROLE, ASK_TRIP_TYPE_DRIVER, ASK_DATE_DRIVER, ASK_HOUR_DRIVER, ASK_MINUTE_DRIVER, ASK_LOCATION_DRIVER, ASK_SEATS, ASK_TRIP_TYPE_PASSENGER, ASK_DATE_PASSENGER, ASK_HOUR_PASSENGER, ASK_MINUTE_PASSENGER, ASK_LOCATION_PASSENGER, ASK_COMMENT_PASSENGER, ASK_SEATS_PASSENGER = range(14)
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Привет! 👋 Я бот для поиска попутчиков на склад.\n\n"
-        "Выберите роль:\n"
-        "→ /driver — если вы водитель\n"
-        "→ /passenger — если вы пассажир\n\n"
-        "После выбора роли используйте:\n"
-        "→ /new_ride — создать поездку (водитель)\n"
-        "→ /find_ride — найти поездку (пассажир)"
-    )
+# --- Настройка логирования ---
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-if not TOKEN or not WEBHOOK_URL:
-    raise RuntimeError("❌ TELEGRAM_TOKEN и WEBHOOK_URL обязательны!")
-
-# === Состояния (через user_data флаги) ===
-STATE_AWAITING = "awaiting"
-STATE_ROUTE_CONFIRM = "route_confirm"
-STATE_ADD_WAYPOINTS = "add_waypoints"
-
-# === База данных ===
+# --- Инициализация базы данных ---
 def init_db():
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
-    cursor.execute('''
+    """Создает таблицы в базе данных, если они не существуют."""
+    conn = sqlite3.connect('carpool_bot.db') # Используем локальный файл для примера
+    c = conn.cursor()
+    c.execute('''
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
-            role TEXT NOT NULL
+            role TEXT
         )
     ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS driver_rides (
-            ride_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            departure_lat REAL NOT NULL,
-            departure_lon REAL NOT NULL,
-            waypoints TEXT,  -- JSON строка: [[lat,lon], ...]
-            date TEXT NOT NULL,
-            time TEXT NOT NULL,
-            seats INTEGER NOT NULL,
-            confirmed BOOLEAN DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS trips (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            driver_id INTEGER,
+            trip_type TEXT, -- 'to_warehouse', 'from_warehouse'
+            start_time TEXT, -- ISO format datetime
+            start_point TEXT, -- JSON string [lat, lon]
+            end_point TEXT, -- JSON string [lat, lon]
+            polyline TEXT, -- Encoded polyline string
+            available_seats INTEGER,
+            FOREIGN KEY(driver_id) REFERENCES users(user_id)
         )
     ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS passenger_requests (
-            request_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            lat REAL NOT NULL,
-            lon REAL NOT NULL,
-            date TEXT NOT NULL,
-            time TEXT NOT NULL,
-            matched_ride_id INTEGER,
-            notified BOOLEAN DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS matches (
-            match_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ride_id INTEGER NOT NULL,
-            request_id INTEGER NOT NULL,
-            driver_approved BOOLEAN DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            passenger_id INTEGER,
+            trip_type TEXT, -- 'to_warehouse', 'from_warehouse'
+            request_time TEXT, -- ISO format datetime
+            pickup_point TEXT, -- JSON string [lat, lon]
+            pickup_comment TEXT,
+            required_seats INTEGER,
+            FOREIGN KEY(passenger_id) REFERENCES users(user_id)
         )
     ''')
     conn.commit()
     conn.close()
 
-def save_role(user_id, role):
-    conn = sqlite3.connect('users.db')
-    conn.execute('INSERT OR REPLACE INTO users (user_id, role) VALUES (?, ?)', (user_id, role))
-    conn.commit()
-    conn.close()
+# --- Вспомогательные функции ---
+def encode_coords_to_polyline(coords_list):
+    """Кодирует список координат в строку polyline."""
+    # coords_list: [[lat1, lon1], [lat2, lon2], ...]
+    return polyline.encode(coords_list)
 
-def cleanup_old_requests():
-    """Удаляет запросы пассажиров, если прошло >2 часов с указанного времени"""
-    conn = sqlite3.connect('users.db')
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    conn.execute('''
-        DELETE FROM passenger_requests
-        WHERE datetime(date || " " || time, "+2 hours") < ?
-    ''', (now,))
-    conn.commit()
-    conn.close()
+def decode_polyline_to_coords(polyline_str):
+    """Декодирует строку polyline в список координат."""
+    # polyline_str: "u{~vFvyys@fZp|@~@vA"
+    return polyline.decode(polyline_str)
 
-# === OpenRouteService ===
-def get_route_polyline(start_lat, start_lon, waypoints, api_key, warehouse_coords):
-    coords = [[start_lon, start_lat]]
-    if waypoints:
-        for lat, lon in waypoints:
-            coords.append([lon, lat])
-    coords.append(warehouse_coords)
-    
+def get_ors_route(start_coords, end_coords):
+    """Получает маршрут по дорогам через OpenRouteService (ORS) API."""
+    # ORS API Documentation: https://openrouteservice.org/dev/#/api-docs/v2/directions/{profile}/post
+    # Profile: driving-car, cycling-regular, foot-walking, etc.
     url = "https://api.openrouteservice.org/v2/directions/driving-car"
-    headers = {'Authorization': api_key, 'Content-Type': 'application/json'}
-    body = {"coordinates": coords}
-    try:
-        resp = requests.post(url, json=body, headers=headers, timeout=10)
-        if resp.status_code == 200:
-            data = resp.json()
-            return data['routes'][0]['geometry'], data['routes'][0]['summary']['distance']
-    except Exception as e:
-        logging.error(f"ORS route error: {e}")
-    return None, 0
-
-def get_static_map_url(start_lat, start_lon, waypoints, warehouse_coords, api_key):
-    coords = [[start_lon, start_lat]]
-    if waypoints:
-        for lat, lon in waypoints:
-            coords.append([lon, lat])
-    coords.append(warehouse_coords)
     
-    polyline_str = quote(polyline.encode([(lat, lon) for lon, lat in coords]))
-    markers = f"{start_lon},{start_lat};{warehouse_coords[0]},{warehouse_coords[1]}"
-    url = (
-        f"https://api.openrouteservice.org/v1/maps/static?api_key={api_key}"
-        f"&size=600x400&format=png&coordinates={polyline_str}"
-        f"&markers={markers}&theme=light"
-    )
-    return url
+    headers = {
+        "Authorization": f"Bearer {ORS_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    
+    # Формат тела запроса для ORS: "coordinates": [[lon, lat], [lon, lat], ...]
+    payload = {
+        "coordinates": [
+            [start_coords[1], start_coords[0]],  # [lon, lat]
+            [end_coords[1], end_coords[0]]       # [lon, lat]
+        ],
+        "format": "geojson", # Получаем ответ в формате GeoJSON
+        # "instructions": False, # Опционально: отключить инструкции для уменьшения ответа
+        # "geometry_simplify": True # Опционально: упростить геометрию
+    }
 
-def is_point_near_route(pass_lat, pass_lon, start_lat, start_lon, waypoints=None, max_dist_m=100):
-    polyline_str, _ = get_route_polyline(start_lat, start_lon, waypoints, ORS_API_KEY, WAREHOUSE_COORDS)
-    if not polyline_str:
-        return False
     try:
-        coords = polyline.decode(polyline_str)
-        for lat, lon in coords:
-            if geodesic((pass_lat, pass_lon), (lat, lon)).meters <= max_dist_m:
-                return True
+        response = requests.post(url, json=payload, headers=headers)
+        response.raise_for_status() # Вызовет исключение для кодов ошибок HTTP (4xx, 5xx)
+        data = response.json()
+        
+        # Проверяем, есть ли маршрут в ответе
+        if 'features' in data and len(data['features']) > 0:
+            geometry = data['features'][0]['geometry']
+            if geometry['type'] == 'LineString':
+                coords = geometry['coordinates'] # coords = [[lon1, lat1], [lon2, lat2], ...]
+                # ORS возвращает [lon, lat], но наш код ожидает [lat, lon]
+                coords_lat_lon = [[lat, lon] for lon, lat in coords]
+                polyline_str = encode_coords_to_polyline(coords_lat_lon)
+                return polyline_str
+            else:
+                logger.error(f"ORS API returned unexpected geometry type: {geometry['type']}")
+        else:
+            logger.error(f"ORS API returned no features: {data}")
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"HTTP error from ORS API: {e}")
+        logger.error(f"Response content: {response.text}")
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Request error to ORS API: {e}")
     except Exception as e:
-        logging.error(f"Polyline decode error: {e}")
+        logger.error(f"Unexpected error getting ORS route: {e}")
+    
+    return None # Возвращаем None в случае ошибки
+
+
+def is_point_near_polyline(point, polyline_coords, tolerance_m=300):
+    """Проверяет, находится ли точка в пределах tolerance_m метров от линии маршрута."""
+    point_tuple = (point[0], point[1])
+    for i in range(len(polyline_coords) - 1):
+        start = (polyline_coords[i][0], polyline_coords[i][1])
+        end = (polyline_coords[i+1][0], polyline_coords[i+1][1])
+        # Приблизительный расчет расстояния от точки до отрезка
+        dist_to_segment = geodesic(point_tuple, start).meters
+        if dist_to_segment <= tolerance_m:
+            return True
+        dist_to_segment = geodesic(point_tuple, end).meters
+        if dist_to_segment <= tolerance_m:
+            return True
+        # Более точный расчет (упрощенный, можно улучшить)
+        dist_to_segment = geodesic(point_tuple, ((start[0] + end[0]) / 2, (start[1] + end[1]) / 2)).meters
+        if dist_to_segment <= tolerance_m:
+            return True
     return False
 
-# === Вспомогательные функции ===
-async def set_bot_commands(application):
-    commands = [
-        BotCommand("start", "Запустить бота"),
-        BotCommand("driver", "Я водитель"),
-        BotCommand("passenger", "Я пассажир"),
-        BotCommand("new_ride", "Создать поездку"),
-        BotCommand("find_ride", "Найти поездку"),
-        BotCommand("my_rides", "Мои поездки"),
-        BotCommand("my_requests", "Мои запросы"),
-    ]
-    await application.bot.set_my_commands(commands)
-    await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
-
-# === Водитель: дата → час → минуты → гео → маршрут ===
-async def new_ride(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... проверка роли и лимита (аналогично предыдущей версии) ...
-    today = datetime.now().date()
-    buttons = [[InlineKeyboardButton((today + timedelta(days=i)).strftime("%d.%m"),
-                                     callback_data=f"date_{(today + timedelta(days=i)).isoformat()}")]
-               for i in range(7)]
-    await update.message.reply_text("📅 Выберите дату:", reply_markup=InlineKeyboardMarkup(buttons))
-
-async def handle_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    context.user_data['date'] = query.data.split("_")[1]
-    # Часы 0–23
-    buttons = [[InlineKeyboardButton(f"{h:02d}", callback_data=f"hour_{h}") for h in range(i, min(i+6, 24))]
-               for i in range(0, 24, 6)]
-    await query.edit_message_text("🕒 Выберите час:", reply_markup=InlineKeyboardMarkup(buttons))
-
-async def handle_hour(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    context.user_data['hour'] = query.data.split("_")[1]
-    hour = int(context.user_data['hour'])
-    # Минуты с шагом 5
-    minutes = [f"{m:02d}" for m in range(0, 60, 5)]
-    buttons = [[InlineKeyboardButton(m, callback_data=f"minute_{m}") for m in minutes[i:i+5]]
-               for i in range(0, len(minutes), 5)]
-    await query.edit_message_text(f"🕒 {hour}:__ — выберите минуты:", reply_markup=InlineKeyboardMarkup(buttons))
-
-async def handle_minute(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    context.user_data['minute'] = query.data.split("_")[1]
-    context.user_data[STATE_AWAITING] = 'driver_location'
-    await query.edit_message_text("📍 Отправьте точку отправления:")
-
-async def handle_driver_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get(STATE_AWAITING) != 'driver_location':
-        return
-    lat = update.message.location.latitude
-    lon = update.message.location.longitude
-    context.user_data.update({'lat': lat, 'lon': lon, 'waypoints': []})
-    await show_route_preview(update, context)
-
-async def show_route_preview(update, context):
-    lat = context.user_data['lat']
-    lon = context.user_data['lon']
-    waypoints = context.user_data.get('waypoints', [])
-    
-    polyline_str, distance = get_route_polyline(lat, lon, waypoints, ORS_API_KEY, WAREHOUSE_COORDS)
-    if not polyline_str:
-        await update.message.reply_text("❌ Не удалось построить маршрут.")
-        return
-
-    map_url = get_static_map_url(lat, lon, waypoints, WAREHOUSE_COORDS, ORS_API_KEY)
-    time_str = f"{context.user_data['hour']}:{context.user_data['minute']}"
-    date_str = context.user_data['date']
-
+# --- Основные обработчики ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отправляет приветственное сообщение и предлагает выбрать роль."""
     keyboard = [
-        [InlineKeyboardButton("✅ Подтвердить маршрут", callback_data="confirm_route")],
-        [InlineKeyboardButton("➕ Добавить точку", callback_data="add_waypoint")]
+        [InlineKeyboardButton("Я водитель", callback_data='role_driver')],
+        [InlineKeyboardButton("Я пассажир", callback_data='role_passenger')]
     ]
-    await update.message.reply_photo(
-        photo=map_url,
-        caption=f"Маршрут построен!\nДата: {date_str}\nВремя: {time_str}\nРасстояние: {distance/1000:.1f} км",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-    context.user_data[STATE_AWAITING] = None
-    context.user_data[STATE_ROUTE_CONFIRM] = True
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text('Привет! Выберите вашу роль:', reply_markup=reply_markup)
 
-async def handle_route_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_role_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает выбор роли пользователем."""
     query = update.callback_query
     await query.answer()
-    if query.data == "confirm_route":
-        # Сохраняем поездку
-        user_id = query.from_user.id
-        date_iso = context.user_data['date']
-        time_str = f"{context.user_data['hour']}:{context.user_data['minute']}"
-        lat = context.user_data['lat']
-        lon = context.user_data['lon']
-        waypoints = str(context.user_data.get('waypoints', []))  # JSON-like string
+    user_id = query.from_user.id
+    role = query.data.split('_')[1]
 
-        conn = sqlite3.connect('users.db')
-        conn.execute('''
-            INSERT INTO driver_rides (user_id, departure_lat, departure_lon, waypoints, date, time, seats, confirmed)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 1)
-        ''', (user_id, lat, lon, waypoints, date_iso, time_str, 2))  # seats=2 по умолчанию
-        conn.commit()
-        conn.close()
-        await query.edit_message_caption("✅ Поездка создана и подтверждена!")
-        # Запуск проверки пассажиров...
-    elif query.data == "add_waypoint":
-        context.user_data[STATE_ADD_WAYPOINTS] = True
-        await query.edit_message_caption("📍 Отправьте дополнительную точку маршрута:")
+    conn = sqlite3.connect('carpool_bot.db')
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO users (user_id, role) VALUES (?, ?)", (user_id, role))
+    conn.commit()
+    conn.close()
 
-# === Пассажир: аналогично с выбором времени → гео → сохранение ===
-async def find_ride(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... аналогично водителю: дата → час → минуты ...
-    pass  # реализуется по аналогии
+    await query.edit_message_text(f"Вы выбрали роль: {role.capitalize()}")
+    context.user_data['role'] = role
 
-async def handle_passenger_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Сохраняем запрос
+    if role == 'driver':
+        keyboard = [
+            [InlineKeyboardButton("Создать поездку", callback_data='create_trip_driver')],
+            [InlineKeyboardButton("Управление маршрутами", callback_data='manage_trips_driver')]
+        ]
+    else: # passenger
+        keyboard = [
+            [InlineKeyboardButton("Создать запрос", callback_data='create_request_passenger')],
+            [InlineKeyboardButton("Управление запросами", callback_data='manage_requests_passenger')]
+        ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.message.reply_text("Выберите действие:", reply_markup=reply_markup)
+
+async def create_trip_driver(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начинает процесс создания поездки для водителя."""
+    keyboard = [
+        [InlineKeyboardButton("До склада", callback_data='type_to_warehouse')],
+        [InlineKeyboardButton("От склада", callback_data='type_from_warehouse')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.callback_query.message.reply_text("Выберите тип поездки:", reply_markup=reply_markup)
+    return ASK_TRIP_TYPE_DRIVER
+
+async def ask_date_driver(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Запрашивает дату поездки у водителя с помощью кнопок."""
+    context.user_data['trip_type'] = update.callback_query.data.split('_')[1]
+
+    keyboard = []
+    today = datetime.today().date()
+    for i in range(7):
+        day = today + timedelta(days=i)
+        keyboard.append([InlineKeyboardButton(day.strftime('%Y-%m-%d'), callback_data=f'date_{day.strftime("%Y-%m-%d")}')])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.callback_query.message.reply_text("Выберите дату поездки:", reply_markup=reply_markup)
+    return ASK_DATE_DRIVER
+
+async def ask_hour_driver(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Запрашивает час поездки у водителя с помощью кнопок."""
+    selected_date = update.callback_query.data.split('_')[1]
+    context.user_data['selected_date'] = selected_date
+
+    keyboard = []
+    for hour in range(24):
+        keyboard.append([InlineKeyboardButton(f'{hour:02d}:00', callback_data=f'hour_{hour:02d}')])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.callback_query.message.reply_text("Выберите час поездки:", reply_markup=reply_markup)
+    return ASK_HOUR_DRIVER
+
+async def ask_minute_driver(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Запрашивает минуты поездки у водителя с помощью кнопок."""
+    selected_hour = update.callback_query.data.split('_')[1]
+    context.user_data['selected_hour'] = selected_hour
+
+    keyboard = []
+    for minute in range(0, 60, 5): # Каждые 5 минут
+        keyboard.append([InlineKeyboardButton(f'{selected_hour}:{minute:02d}', callback_data=f'min_{minute:02d}')])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.callback_query.message.reply_text("Выберите минуты поездки:", reply_markup=reply_markup)
+    return ASK_MINUTE_DRIVER
+
+async def ask_location_driver(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Запрашивает геопозицию у водителя."""
+    selected_minute = update.callback_query.data.split('_')[1]
+    selected_time_str = f"{context.user_data['selected_date']} {context.user_data['selected_hour']}:{selected_minute}"
+    context.user_data['trip_time'] = selected_time_str
+
+    trip_type = context.user_data['trip_type']
+    if trip_type == 'to_warehouse':
+        await update.callback_query.message.reply_text("Отправьте геопозицию вашего дома (точка отправления):")
+    else: # from_warehouse
+        await update.callback_query.message.reply_text("Отправьте геопозицию места назначения (точка прибытия):")
+    return ASK_LOCATION_DRIVER
+
+async def ask_seats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Запрашивает количество мест у водителя."""
+    location = update.message.location
+    context.user_data['location'] = [location.latitude, location.longitude]
+    await update.message.reply_text("Сколько мест доступно в вашей машине (1-7)?")
+    return ASK_SEATS
+
+async def save_trip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Сохраняет поездку водителя в базу данных."""
+    try:
+        seats = int(update.message.text)
+        if not 1 <= seats <= 7:
+            await update.message.reply_text("Количество мест должно быть от 1 до 7.")
+            return ASK_SEATS
+    except ValueError:
+        await update.message.reply_text("Пожалуйста, введите число.")
+        return ASK_SEATS
+
+    context.user_data['seats'] = seats
+
     user_id = update.effective_user.id
-    lat = update.message.location.latitude
-    lon = update.message.location.longitude
-    # ... получаем date/time из user_data ...
+    trip_type = context.user_data['trip_type']
+    trip_time = context.user_data['trip_time']
+    start_point = context.user_data['location'] # [lat, lon]
+    # Используем фиксированные координаты склада
+    end_point = WAREHOUSE_POINT if trip_type == 'to_warehouse' else start_point
+    start_point = start_point if trip_type == 'to_warehouse' else WAREHOUSE_POINT
 
-    conn = sqlite3.connect('users.db')
-    conn.execute('''
-        INSERT INTO passenger_requests (user_id, lat, lon, date, time)
-        VALUES (?, ?, ?, ?, ?)
-    ''', (user_id, lat, lon, date_iso, time_str))
-    req_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn = sqlite3.connect('carpool_bot.db')
+    c = conn.cursor()
+
+    # Проверка лимита поездок
+    c.execute("SELECT COUNT(*) FROM trips WHERE driver_id = ?", (user_id,))
+    trip_count = c.fetchone()[0]
+    if trip_count >= 5:
+        conn.close()
+        await update.message.reply_text("Вы достигли лимита в 5 активных поездок.")
+        return ConversationHandler.END
+
+    # Построение маршрута по дорогам через ORS
+    polyline_str = get_ors_route(start_point, end_point)
+    if not polyline_str:
+        await update.message.reply_text("Не удалось построить маршрут. Проверьте API ключ и попробуйте позже.")
+        return ConversationHandler.END
+
+    # ХОРОШИЙ СПОСОБ (используем json):
+    import json
+    start_point_str = json.dumps(start_point)
+    end_point_str = json.dumps(end_point)
+
+    c.execute("""
+        INSERT INTO trips (driver_id, trip_type, start_time, start_point, end_point, polyline, available_seats)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (user_id, trip_type, trip_time, start_point_str, end_point_str, polyline_str, seats))
+    trip_id = c.lastrowid
     conn.commit()
     conn.close()
 
-    # Ищем активные поездки
-    matched = False
-    conn = sqlite3.connect('users.db')
-    rides = conn.execute('''
-        SELECT ride_id, user_id, departure_lat, departure_lon, waypoints
-        FROM driver_rides
-        WHERE date = ? AND time BETWEEN ? AND ? AND confirmed = 1
-    ''', (date_iso, min_t, max_t)).fetchall()
+    await update.message.reply_text(f"Поездка создана! Тип: {trip_type}, Время: {trip_time}, Мест: {seats}/7")
+
+    # Проверка совпадений с запросами пассажиров
+    await check_matches_for_new_trip(update, context, trip_id)
+
+    return ConversationHandler.END
+
+async def check_matches_for_new_trip(update, context, trip_id):
+    """Проверяет совпадения новой поездки водителя с существующими запросами пассажиров."""
+    conn = sqlite3.connect('carpool_bot.db')
+    c = conn.cursor()
+    c.execute("SELECT * FROM trips WHERE id = ?", (trip_id,))
+    trip = c.fetchone()
+    if not trip:
+        conn.close()
+        return
+
+    driver_id, trip_type, trip_time_str, start_point_str, end_point_str, polyline_str, available_seats = trip
+    trip_time = datetime.strptime(trip_time_str, '%Y-%m-%d %H:%M')
+    polyline_coords = decode_polyline_to_coords(polyline_str)
+
+    # Найти запросы в нужное время и тип (сначала проверяем время)
+    c.execute("""
+        SELECT * FROM requests
+        WHERE trip_type = ? AND request_time BETWEEN ? AND ?
+    """, (trip_type, (trip_time - timedelta(hours=1)).isoformat(' '), (trip_time + timedelta(hours=1)).isoformat(' ')))
+    matching_requests = c.fetchall()
+
+    for req in matching_requests:
+        req_id, passenger_id, req_type, req_time_str, pickup_point_str, _, req_seats = req
+        # ХОРОШИЙ СПОСОБ (используем json):
+        import json
+        try:
+            pickup_point = json.loads(pickup_point_str)
+            if not isinstance(pickup_point, list) or len(pickup_point) != 2:
+                 raise ValueError("Неверный формат точки")
+        except (json.JSONDecodeError, ValueError):
+            logger.error(f"Ошибка парсинга pickup_point для req_id {req_id}: {pickup_point_str}")
+            continue # Пропустить некорректную запись
+
+        # Теперь проверяем дистанцию, так как время совпадает
+        if req_seats <= available_seats and is_point_near_polyline(pickup_point, polyline_coords):
+            # Найти имя пассажира
+            passenger_name = (await context.bot.get_chat(passenger_id)).first_name
+            # Отправить уведомление водителю
+            keyboard = [
+                [InlineKeyboardButton("Принять", callback_data=f'accept_{req_id}_{trip_id}'),
+                 InlineKeyboardButton("Отклонить", callback_data=f'reject_{req_id}')],
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await context.bot.send_message(
+                chat_id=driver_id,
+                text=f"Новый пассажир!\nИмя: {passenger_name}\nВремя запроса: {req_time_str}\nТочка посадки: {pickup_point} (проверьте комментарий)\nМест нужно: {req_seats}\nБрать пассажира?",
+                reply_markup=reply_markup
+            )
+            # Уведомить пассажира о совпадении
+            await context.bot.send_message(
+                chat_id=passenger_id,
+                text="Найден водитель! Ожидаем подтверждения..."
+            )
+
     conn.close()
 
-    for ride_id, driver_id, d_lat, d_lon, wp_str in rides:
-        waypoints = eval(wp_str) if wp_str else []
-        if is_point_near_route(lat, lon, d_lat, d_lon, waypoints):
-            # Создаём матч
-            conn = sqlite3.connect('users.db')
-            conn.execute('INSERT INTO matches (ride_id, request_id) VALUES (?, ?)', (ride_id, req_id))
-            match_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-            conn.commit()
-            conn.close()
+# --- Обработчики для пассажира ---
+async def create_request_passenger(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начинает процесс создания запроса для пассажира."""
+    keyboard = [
+        [InlineKeyboardButton("До склада", callback_data='type_to_warehouse')],
+        [InlineKeyboardButton("От склада", callback_data='type_from_warehouse')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.callback_query.message.reply_text("Выберите тип поездки:", reply_markup=reply_markup)
+    context.user_data['creating_request'] = True # Флаг для определения контекста callback'а
+    return ASK_TRIP_TYPE_PASSENGER
 
-            # Уведомляем водителя
-            passenger = await context.bot.get_chat(user_id)
-            keyboard = [[InlineKeyboardButton("✅ Взять", callback_data=f"approve_{match_id}"),
-                         InlineKeyboardButton("❌ Отклонить", callback_data=f"reject_{match_id}")]]
+async def ask_date_passenger(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Запрашивает дату запроса у пассажира с помощью кнопок."""
+    context.user_data['trip_type'] = update.callback_query.data.split('_')[1]
+
+    keyboard = []
+    today = datetime.today().date()
+    for i in range(7):
+        day = today + timedelta(days=i)
+        keyboard.append([InlineKeyboardButton(day.strftime('%Y-%m-%d'), callback_data=f'date_{day.strftime("%Y-%m-%d")}')])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.callback_query.message.reply_text("Выберите дату поездки:", reply_markup=reply_markup)
+    return ASK_DATE_PASSENGER
+
+async def ask_hour_passenger(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Запрашивает час запроса у пассажира с помощью кнопок."""
+    selected_date = update.callback_query.data.split('_')[1]
+    context.user_data['selected_date'] = selected_date
+
+    keyboard = []
+    for hour in range(24):
+        keyboard.append([InlineKeyboardButton(f'{hour:02d}:00', callback_data=f'hour_{hour:02d}')])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.callback_query.message.reply_text("Выберите час поездки:", reply_markup=reply_markup)
+    return ASK_HOUR_PASSENGER
+
+async def ask_minute_passenger(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Запрашивает минуты запроса у пассажира с помощью кнопок."""
+    selected_hour = update.callback_query.data.split('_')[1]
+    context.user_data['selected_hour'] = selected_hour
+
+    keyboard = []
+    for minute in range(0, 60, 5): # Каждые 5 минут
+        keyboard.append([InlineKeyboardButton(f'{selected_hour}:{minute:02d}', callback_data=f'min_{minute:02d}')])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.callback_query.message.reply_text("Выберите минуты поездки:", reply_markup=reply_markup)
+    return ASK_MINUTE_PASSENGER
+
+async def ask_location_passenger(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Запрашивает геопозицию у пассажира."""
+    selected_minute = update.callback_query.data.split('_')[1]
+    selected_time_str = f"{context.user_data['selected_date']} {context.user_data['selected_hour']}:{selected_minute}"
+    context.user_data['request_time'] = selected_time_str
+
+    await update.callback_query.message.reply_text("Отправьте геопозицию вашей точки посадки:")
+    return ASK_LOCATION_PASSENGER
+
+async def ask_comment_passenger(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Запрашивает комментарий к точке посадки."""
+    location = update.message.location
+    context.user_data['location'] = [location.latitude, location.longitude]
+    await update.message.reply_text("Введите короткое название или комментарий к точке посадки (например, 'Остановка Малунцева'):")
+    return ASK_COMMENT_PASSENGER
+
+async def ask_seats_passenger(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Запрашивает количество мест, необходимых пассажиру."""
+    context.user_data['comment'] = update.message.text
+    await update.message.reply_text("Сколько мест вам нужно (1-7)?")
+    return ASK_SEATS_PASSENGER
+
+async def save_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Сохраняет запрос пассажира в базу данных."""
+    try:
+        seats = int(update.message.text)
+        if not 1 <= seats <= 4: # Логично ограничить запрос не больше 4 мест
+            await update.message.reply_text("Количество мест для запроса должно быть от 1 до 4.")
+            return ASK_SEATS_PASSENGER
+    except ValueError:
+        await update.message.reply_text("Пожалуйста, введите число.")
+        return ASK_SEATS_PASSENGER
+
+    context.user_data['required_seats'] = seats
+
+    user_id = update.effective_user.id
+    trip_type = context.user_data['trip_type']
+    request_time = context.user_data['request_time']
+    pickup_point = context.user_data['location']
+    comment = context.user_data['comment']
+    req_seats = context.user_data['required_seats']
+
+    conn = sqlite3.connect('carpool_bot.db')
+    c = conn.cursor()
+
+    # Проверка лимита запросов
+    c.execute("SELECT COUNT(*) FROM requests WHERE passenger_id = ?", (user_id,))
+    req_count = c.fetchone()[0]
+    if req_count >= 5:
+        conn.close()
+        await update.message.reply_text("Вы достигли лимита в 5 активных запросов.")
+        return ConversationHandler.END
+
+    # ХОРОШИЙ СПОСОБ (используем json):
+    import json
+    pickup_point_str = json.dumps(pickup_point)
+
+    c.execute("""
+        INSERT INTO requests (passenger_id, trip_type, request_time, pickup_point, pickup_comment, required_seats)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (user_id, trip_type, request_time, pickup_point_str, comment, req_seats))
+    req_id = c.lastrowid
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text(f"Запрос создан! Тип: {trip_type}, Время: {request_time}, Мест нужно: {req_seats}")
+
+    # Проверка совпадений с поездками водителей
+    await check_matches_for_new_request(update, context, req_id)
+
+    return ConversationHandler.END
+
+async def check_matches_for_new_request(update, context, req_id):
+    """Проверяет совпадения нового запроса пассажира с существующими поездками водителей."""
+    conn = sqlite3.connect('carpool_bot.db')
+    c = conn.cursor()
+    c.execute("SELECT * FROM requests WHERE id = ?", (req_id,))
+    request = c.fetchone()
+    if not request:
+        conn.close()
+        return
+
+    req_id, passenger_id, req_type, req_time_str, pickup_point_str, comment, req_seats = request
+    req_time = datetime.strptime(req_time_str, '%Y-%m-%d %H:%M')
+    # ХОРОШИЙ СПОСОБ (используем json):
+    import json
+    try:
+        pickup_point = json.loads(pickup_point_str)
+        if not isinstance(pickup_point, list) or len(pickup_point) != 2:
+             raise ValueError("Неверный формат точки")
+    except (json.JSONDecodeError, ValueError):
+        logger.error(f"Ошибка парсинга pickup_point для req_id {req_id}: {pickup_point_str}")
+        conn.close()
+        return # Пропустить некорректную запись
+
+    # Найти поездки в нужное время и тип (сначала проверяем время)
+    c.execute("""
+        SELECT * FROM trips
+        WHERE trip_type = ? AND start_time BETWEEN ? AND ?
+    """, (req_type, (req_time - timedelta(hours=1)).isoformat(' '), (req_time + timedelta(hours=1)).isoformat(' ')))
+    matching_trips = c.fetchall()
+
+    found_match = False
+    for trip in matching_trips:
+        trip_id, driver_id, trip_type, trip_time_str, start_point_str, end_point_str, polyline_str, available_seats = trip
+        # Теперь проверяем дистанцию, так как время совпадает
+        if req_seats <= available_seats and is_point_near_polyline(pickup_point, decode_polyline_to_coords(polyline_str)):
+            # Найти имя пассажира
+            passenger_name = (await context.bot.get_chat(passenger_id)).first_name
+            # Отправить уведомление водителю
+            keyboard = [
+                [InlineKeyboardButton("Принять", callback_data=f'accept_{req_id}_{trip_id}'),
+                 InlineKeyboardButton("Отклонить", callback_data=f'reject_{req_id}')],
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
             await context.bot.send_message(
-                driver_id,
-                f"👤 Пассажир рядом с вашим маршрутом!\nКоординаты: {lat:.4f}, {lon:.4f}",
-                reply_markup=InlineKeyboardMarkup(keyboard)
+                chat_id=driver_id,
+                text=f"Новый пассажир!\nИмя: {passenger_name}\nВремя запроса: {req_time_str}\nТочка посадки: {comment}\nМест нужно: {req_seats}\nБрать пассажира?",
+                reply_markup=reply_markup
             )
-            matched = True
-            break
+            found_match = True
 
-    if matched:
-        await update.message.reply_text("✅ Найдена поездка! Ожидайте подтверждения от водителя.")
+    if found_match:
+         await context.bot.send_message(
+             chat_id=passenger_id,
+             text="Найден водитель! Ожидаем подтверждения..."
+         )
     else:
-        await update.message.reply_text("❌ Пока нет подходящих поездок.")
+        await context.bot.send_message(
+             chat_id=passenger_id,
+             text="Совпадений с поездками водителей пока нет. Ваш запрос активен."
+         )
 
-# === Обработка согласия водителя ===
-async def handle_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    conn.close()
+
+# --- Обработчики подтверждения/отказа ---
+async def handle_accept_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает принятие или отказ водителем пассажира."""
     query = update.callback_query
     await query.answer()
-    match_id = int(query.data.split("_")[1])
-    driver_id = query.from_user.id
+    data = query.data.split('_')
+    action = data[0]
+    req_id = int(data[1])
 
-    conn = sqlite3.connect('users.db')
-    conn.execute('UPDATE matches SET driver_approved = 1 WHERE match_id = ?', (match_id,))
-    # Получаем данные пассажира
-    data = conn.execute('''
-        SELECT pr.user_id, dr.user_id
-        FROM matches m
-        JOIN passenger_requests pr ON m.request_id = pr.request_id
-        JOIN driver_rides dr ON m.ride_id = dr.ride_id
-        WHERE m.match_id = ?
-    ''', (match_id,)).fetchone()
+    conn = sqlite3.connect('carpool_bot.db')
+    c = conn.cursor()
+    c.execute("SELECT passenger_id, required_seats FROM requests WHERE id = ?", (req_id,))
+    request_details = c.fetchone()
+    if not request_details:
+        await query.edit_message_text("Запрос не найден.")
+        conn.close()
+        return
+
+    passenger_id, req_seats = request_details
+
+    if action == 'accept':
+        trip_id = int(data[2])
+        c.execute("SELECT available_seats FROM trips WHERE id = ?", (trip_id,))
+        available_seats = c.fetchone()[0]
+
+        if req_seats <= available_seats:
+            # Отправить контакт пассажира водителю
+            await context.bot.send_contact(
+                chat_id=query.from_user.id,
+                phone_number=(await context.bot.get_chat(passenger_id)).username or "Нет username", # Telegram может не предоставить номер
+                first_name=(await context.bot.get_chat(passenger_id)).first_name
+            )
+            await query.edit_message_text("Вы приняли пассажира!")
+
+            # Задать вопрос о договоренности
+            keyboard = [
+                [InlineKeyboardButton("Да", callback_data=f'confirm_deal_{req_id}_{trip_id}_yes'),
+                 InlineKeyboardButton("Нет", callback_data=f'confirm_deal_{req_id}_{trip_id}_no')],
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await context.bot.send_message(
+                chat_id=query.from_user.id,
+                text="Договорились с пассажиром?",
+                reply_markup=reply_markup
+            )
+        else:
+            await query.edit_message_text("Недостаточно мест для этого пассажира.")
+    elif action == 'reject':
+        await query.edit_message_text("Вы отказались от пассажира.")
+        await context.bot.send_message(
+            chat_id=passenger_id,
+            text="Вас отказались везти."
+        )
+        # Удаляем запрос, если он не нужен после отказа
+        # c.execute("DELETE FROM requests WHERE id = ?", (req_id,))
+
     conn.commit()
     conn.close()
 
-    if data:
-        passenger_id, driver_id = data
-        # Отправляем контакты
-        try:
-            passenger = await context.bot.get_chat(passenger_id)
-            driver = await context.bot.get_chat(driver_id)
-            await context.bot.send_message(driver_id, f"Контакт пассажира: @{passenger.username or 'недоступен'}")
-            await context.bot.send_message(passenger_id, f"Контакт водителя: @{driver.username or 'недоступен'}")
-            await query.edit_message_text("✅ Контакты отправлены!")
-        except Exception as e:
-            logging.error(f"Ошибка отправки контактов: {e}")
+async def handle_deal_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает подтверждение договоренности и обновляет количество мест."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data.split('_')
+    if data[0] != 'confirm' or data[-1] not in ['yes', 'no']:
+        return
 
-# === Основная функция ===
+    req_id = int(data[2])
+    trip_id = int(data[3])
+    confirmed = data[-1] == 'yes'
+
+    conn = sqlite3.connect('carpool_bot.db')
+    c = conn.cursor()
+
+    if confirmed:
+        # Получить количество мест, которые нужно отнять
+        c.execute("SELECT required_seats FROM requests WHERE id = ?", (req_id,))
+        seats_to_reduce = c.fetchone()[0]
+
+        # Обновить количество доступных мест
+        c.execute("""
+            UPDATE trips
+            SET available_seats = available_seats - ?
+            WHERE id = ?
+        """, (seats_to_reduce, trip_id))
+        await query.edit_message_text("Договорились! Места обновлены.")
+    else:
+        await query.edit_message_text("Договориться не удалось.")
+
+    conn.commit()
+    conn.close()
+
+# --- Управление маршрутами/запросами ---
+async def manage_trips_driver(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает водителю его активные поездки."""
+    user_id = update.effective_user.id
+    conn = sqlite3.connect('carpool_bot.db')
+    c = conn.cursor()
+    c.execute("SELECT id, trip_type, start_time, available_seats FROM trips WHERE driver_id = ?", (user_id,))
+    trips = c.fetchall()
+    conn.close()
+
+    if not trips:
+        await update.callback_query.message.reply_text("У вас нет активных поездок.")
+        return
+
+    message_text = "Ваши активные поездки:\n"
+    keyboard = []
+    for trip in trips:
+        t_id, t_type, t_time, seats = trip
+        message_text += f"- ID: {t_id}, Тип: {t_type}, Время: {t_time}, Мест: {seats}\n"
+        keyboard.append([InlineKeyboardButton(f"Удалить поездку {t_id}", callback_data=f'delete_trip_{t_id}')])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.callback_query.message.reply_text(message_text, reply_markup=reply_markup)
+
+async def manage_requests_passenger(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает пассажиру его активные запросы."""
+    user_id = update.effective_user.id
+    conn = sqlite3.connect('carpool_bot.db')
+    c = conn.cursor()
+    c.execute("SELECT id, trip_type, request_time, pickup_comment, required_seats FROM requests WHERE passenger_id = ?", (user_id,))
+    requests = c.fetchall()
+    conn.close()
+
+    if not requests:
+        await update.callback_query.message.reply_text("У вас нет активных запросов.")
+        return
+
+    message_text = "Ваши активные запросы:\n"
+    keyboard = []
+    for req in requests:
+        r_id, r_type, r_time, comment, seats = req
+        message_text += f"- ID: {r_id}, Тип: {r_type}, Время: {r_time}, Коммент: {comment}, Мест: {seats}\n"
+        keyboard.append([InlineKeyboardButton(f"Удалить запрос {r_id}", callback_data=f'delete_request_{r_id}')])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.callback_query.message.reply_text(message_text, reply_markup=reply_markup)
+
+async def delete_trip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Удаляет поездку водителя."""
+    query = update.callback_query
+    trip_id = int(query.data.split('_')[2])
+    user_id = query.from_user.id
+
+    conn = sqlite3.connect('carpool_bot.db')
+    c = conn.cursor()
+    c.execute("DELETE FROM trips WHERE id = ? AND driver_id = ?", (trip_id, user_id))
+    if c.rowcount > 0:
+        conn.commit()
+        await query.answer("Поездка удалена.")
+    else:
+        await query.answer("Поездка не найдена или вы не являетесь её владельцем.", show_alert=True)
+    conn.close()
+
+async def delete_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Удаляет запрос пассажира."""
+    query = update.callback_query
+    req_id = int(query.data.split('_')[2])
+    user_id = query.from_user.id
+
+    conn = sqlite3.connect('carpool_bot.db')
+    c = conn.cursor()
+    c.execute("DELETE FROM requests WHERE id = ? AND passenger_id = ?", (req_id, user_id))
+    if c.rowcount > 0:
+        conn.commit()
+        await query.answer("Запрос удален.")
+    else:
+        await query.answer("Запрос не найден или вы не являетесь его владельцем.", show_alert=True)
+    conn.close()
+
+# --- Основная функция ---
 def main():
+    """Запускает бота с вебхуками."""
     init_db()
-    app = Application.builder().token(TOKEN).build()
 
-    # Команды
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("driver", driver))
-    app.add_handler(CommandHandler("passenger", passenger))
-    app.add_handler(CommandHandler("new_ride", new_ride))
-    app.add_handler(CommandHandler("find_ride", find_ride))
-    # ... остальные команды ...
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # Callbacks
-    app.add_handler(CallbackQueryHandler(handle_date, pattern="^date_"))
-    app.add_handler(CallbackQueryHandler(handle_hour, pattern="^hour_"))
-    app.add_handler(CallbackQueryHandler(handle_minute, pattern="^minute_"))
-    app.add_handler(CallbackQueryHandler(handle_route_action, pattern="^(confirm_route|add_waypoint)$"))
-    app.add_handler(CallbackQueryHandler(handle_approval, pattern="^(approve|reject)_"))
+    # Conversation для водителя
+    conv_handler_driver = ConversationHandler(
+        entry_points=[CallbackQueryHandler(create_trip_driver, pattern='^create_trip_driver$')],
+        states={
+            ASK_TRIP_TYPE_DRIVER: [CallbackQueryHandler(ask_date_driver)],
+            ASK_DATE_DRIVER: [CallbackQueryHandler(ask_hour_driver)],
+            ASK_HOUR_DRIVER: [CallbackQueryHandler(ask_minute_driver)],
+            ASK_MINUTE_DRIVER: [CallbackQueryHandler(ask_location_driver)],
+            ASK_LOCATION_DRIVER: [MessageHandler(filters.LOCATION, ask_seats)],
+            ASK_SEATS: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_trip)],
+        },
+        fallbacks=[],
+    )
 
-    # Геолокация
-    app.add_handler(MessageHandler(filters.LOCATION, handle_driver_location))
-    app.add_handler(MessageHandler(filters.LOCATION, handle_passenger_location))
+    # Conversation для пассажира
+    conv_handler_passenger = ConversationHandler(
+        entry_points=[CallbackQueryHandler(create_request_passenger, pattern='^create_request_passenger$')],
+        states={
+            ASK_TRIP_TYPE_PASSENGER: [CallbackQueryHandler(ask_date_passenger)],
+            ASK_DATE_PASSENGER: [CallbackQueryHandler(ask_hour_passenger)],
+            ASK_HOUR_PASSENGER: [CallbackQueryHandler(ask_minute_passenger)],
+            ASK_MINUTE_PASSENGER: [CallbackQueryHandler(ask_location_passenger)],
+            ASK_LOCATION_PASSENGER: [MessageHandler(filters.LOCATION, ask_comment_passenger)],
+            ASK_COMMENT_PASSENGER: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_seats_passenger)],
+            ASK_SEATS_PASSENGER: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_request)],
+        },
+        fallbacks=[],
+    )
 
-    # Установка меню
-    import asyncio
-    asyncio.run(set_bot_commands(app))
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CallbackQueryHandler(handle_role_choice, pattern='^role_'))
+    application.add_handler(conv_handler_driver)
+    application.add_handler(conv_handler_passenger)
+    application.add_handler(CallbackQueryHandler(manage_trips_driver, pattern='^manage_trips_driver$'))
+    application.add_handler(CallbackQueryHandler(manage_requests_passenger, pattern='^manage_requests_passenger$'))
+    application.add_handler(CallbackQueryHandler(handle_accept_reject, pattern='^(accept|reject)_'))
+    application.add_handler(CallbackQueryHandler(handle_deal_confirmation, pattern='^confirm_deal_'))
+    application.add_handler(CallbackQueryHandler(delete_trip, pattern='^delete_trip_'))
+    application.add_handler(CallbackQueryHandler(delete_request, pattern='^delete_request_'))
 
-    # Webhook
-    app.run_webhook(
+    # Запуск через вебхуки
+    port = int(os.environ.get('PORT', 8443))  # Render предоставляет PORT
+    application.run_webhook(
         listen="0.0.0.0",
-        port=PORT,
-        webhook_url=f"{WEBHOOK_URL}/{TOKEN}",
-        url_path=TOKEN
+        port=port,
+        url_path=TELEGRAM_BOT_TOKEN,
+        webhook_url=f'https://{os.environ.get("RENDER_EXTERNAL_HOSTNAME")}/{TELEGRAM_BOT_TOKEN}' # URL вашего Render сервиса
     )
 
 if __name__ == '__main__':
