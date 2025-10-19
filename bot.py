@@ -17,15 +17,21 @@ from geopy.distance import geodesic
 import polyline
 import requests # Добавлено для API ORS
 
-# --- Скрытие предупреждений PTB для CallbackQueryHandler в ConversationHandler ---
-from warnings import filterwarnings
-from telegram.warnings import PTBUserWarning
-filterwarnings(action="ignore", message=r".*CallbackQueryHandler", category=PTBUserWarning)
-
 # --- Настройки ---
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN") # Получить из переменных окружения на Render
 ORS_API_KEY = os.environ.get("ORS_API_KEY") # Получить из переменных окружения на Render
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///carpool_bot.db") # Пример для PostgreSQL на Render
+YOUR_ADMIN_USER_ID = 6821825839 # ВСТАВЬТЕ СВОЙ USER ID ТУТ
+
+# --- Скрытие предупреждений PTB для CallbackQueryHandler в ConversationHandler ---
+from warnings import filterwarnings
+from telegram.warnings import PTBUserWarning
+filterwarnings(action="ignore", message=r".*CallbackQueryHandler", category=PTBUserWarning)
+# ---
+
+# --- Скрытие логов httpx (по желанию, для уменьшения шума)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+# ---
 
 # --- Фиксированные координаты склада ---
 # Адрес: Россия, город Омск, ул. Айвазовского, 33
@@ -34,7 +40,7 @@ WAREHOUSE_LON = 73.17325327166235
 WAREHOUSE_POINT = [WAREHOUSE_LAT, WAREHOUSE_LON] # [lat, lon]
 
 # --- Состояния для ConversationHandler ---
-ASK_ROLE, ASK_TRIP_TYPE_DRIVER, ASK_DATE_DRIVER, ASK_HOUR_DRIVER, ASK_MINUTE_DRIVER, ASK_LOCATION_DRIVER, ASK_SEATS, ASK_TRIP_TYPE_PASSENGER, ASK_DATE_PASSENGER, ASK_HOUR_PASSENGER, ASK_MINUTE_PASSENGER, ASK_LOCATION_PASSENGER, ASK_COMMENT_PASSENGER, ASK_SEATS_PASSENGER = range(14)
+ASK_ROLE, ASK_TRIP_TYPE_DRIVER, ASK_DATE_DRIVER, ASK_HOUR_DRIVER, ASK_MINUTE_DRIVER, ASK_LOCATION_DRIVER, ASK_SEATS, ASK_TRIP_TYPE_PASSENGER, ASK_DATE_PASSENGER, ASK_HOUR_PASSENGER, ASK_MINUTE_PASSENGER, ASK_LOCATION_PASSENGER, ASK_COMMENT_PASSENGER, ASK_SEATS_PASSENGER, CONFIRM_BUG_REPORT = range(15)
 
 # --- Настройка логирования ---
 logging.basicConfig(
@@ -131,17 +137,20 @@ def get_ors_route(start_coords, end_coords):
                 return polyline_str
             else:
                 logger.error(f"ORS API returned unexpected geometry type: {geometry['type']}")
+                return None
         else:
             logger.error(f"ORS API returned no features: {data}")
+            return None
     except requests.exceptions.HTTPError as e:
         logger.error(f"HTTP error from ORS API: {e}")
         logger.error(f"Response content: {response.text}")
+        return None
     except requests.exceptions.RequestException as e:
         logger.error(f"Request error to ORS API: {e}")
+        return None
     except Exception as e:
         logger.error(f"Unexpected error getting ORS route: {e}")
-    
-    return None # Возвращаем None в случае ошибки
+        return None # Возвращаем None в случае ошибки
 
 
 def is_point_near_polyline(point, polyline_coords, tolerance_m=300):
@@ -173,6 +182,46 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text('Привет! Выберите вашу роль:', reply_markup=reply_markup)
 
+# --- Новые команды ---
+async def driver_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает меню управления для водителя."""
+    user_id = update.effective_user.id
+    conn = sqlite3.connect('carpool_bot.db')
+    c = conn.cursor()
+    c.execute("SELECT role FROM users WHERE user_id = ?", (user_id,))
+    result = c.fetchone()
+    conn.close()
+
+    if result and result[0] == 'driver':
+        keyboard = [
+            [InlineKeyboardButton("Создать поездку", callback_data='create_trip_driver')],
+            [InlineKeyboardButton("Управление маршрутами", callback_data='manage_trips_driver')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text("Меню водителя:", reply_markup=reply_markup)
+    else:
+        await update.message.reply_text("Пожалуйста, сначала выберите роль 'водитель' с помощью /start.")
+
+async def passenger_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает меню управления для пассажира."""
+    user_id = update.effective_user.id
+    conn = sqlite3.connect('carpool_bot.db')
+    c = conn.cursor()
+    c.execute("SELECT role FROM users WHERE user_id = ?", (user_id,))
+    result = c.fetchone()
+    conn.close()
+
+    if result and result[0] == 'passenger':
+        keyboard = [
+            [InlineKeyboardButton("Создать запрос", callback_data='create_request_passenger')],
+            [InlineKeyboardButton("Управление запросами", callback_data='manage_requests_passenger')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text("Меню пассажира:", reply_markup=reply_markup)
+    else:
+        await update.message.reply_text("Пожалуйста, сначала выберите роль 'пассажир' с помощью /start.")
+
+# --- Старые обработчики (без изменений, кроме добавления команды в ConversationHandler) ---
 async def handle_role_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обрабатывает выбор роли пользователем."""
     query = update.callback_query
@@ -213,38 +262,56 @@ async def create_trip_driver(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return ASK_TRIP_TYPE_DRIVER
 
 async def ask_date_driver(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Запрашивает дату поездки у водителя с помощью кнопок."""
+    """Запрашивает дату поездки у водителя с помощью кнопок (компактно)."""
     context.user_data['trip_type'] = update.callback_query.data.split('_')[1]
 
     keyboard = []
     today = datetime.today().date()
+    row = []
     for i in range(7):
         day = today + timedelta(days=i)
-        keyboard.append([InlineKeyboardButton(day.strftime('%Y-%m-%d'), callback_data=f'date_{day.strftime("%Y-%m-%d")}')])
+        row.append(InlineKeyboardButton(day.strftime('%d.%m'), callback_data=f'date_{day.strftime("%Y-%m-%d")}') )
+        if len(row) == 3: # 3 кнопки в строке
+            keyboard.append(row)
+            row = []
+    if row: # Добавить оставшиеся кнопки, если есть
+        keyboard.append(row)
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.callback_query.message.reply_text("Выберите дату поездки:", reply_markup=reply_markup)
     return ASK_DATE_DRIVER
 
 async def ask_hour_driver(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Запрашивает час поездки у водителя с помощью кнопок."""
+    """Запрашивает час поездки у водителя с помощью кнопок (компактно)."""
     selected_date = update.callback_query.data.split('_')[1]
     context.user_data['selected_date'] = selected_date
 
     keyboard = []
+    row = []
     for hour in range(24):
-        keyboard.append([InlineKeyboardButton(f'{hour:02d}:00', callback_data=f'hour_{hour:02d}')])
+        row.append(InlineKeyboardButton(f'{hour:02d}:00', callback_data=f'hour_{hour:02d}') )
+        if len(row) == 4: # 4 кнопки в строке
+            keyboard.append(row)
+            row = []
+    if row: # Добавить оставшиеся кнопки, если есть
+        keyboard.append(row)
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.callback_query.message.reply_text("Выберите час поездки:", reply_markup=reply_markup)
     return ASK_HOUR_DRIVER
 
 async def ask_minute_driver(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Запрашивает минуты поездки у водителя с помощью кнопок."""
+    """Запрашивает минуты поездки у водителя с помощью кнопок (компактно)."""
     selected_hour = update.callback_query.data.split('_')[1]
     context.user_data['selected_hour'] = selected_hour
 
     keyboard = []
+    row = []
     for minute in range(0, 60, 5): # Каждые 5 минут
-        keyboard.append([InlineKeyboardButton(f'{selected_hour}:{minute:02d}', callback_data=f'min_{minute:02d}')])
+        row.append(InlineKeyboardButton(f'{selected_hour}:{minute:02d}', callback_data=f'min_{minute:02d}') )
+        if len(row) == 4: # 4 кнопки в строке
+            keyboard.append(row)
+            row = []
+    if row: # Добавить оставшиеся кнопки, если есть
+        keyboard.append(row)
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.callback_query.message.reply_text("Выберите минуты поездки:", reply_markup=reply_markup)
     return ASK_MINUTE_DRIVER
@@ -257,6 +324,7 @@ async def ask_location_driver(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     trip_type = context.user_data['trip_type']
     if trip_type == 'to_warehouse':
+        # ИСПРАВЛЕНО: Правильное сообщение для "до склада"
         await update.callback_query.message.reply_text("Отправьте геопозицию вашего дома (точка отправления):")
     else: # from_warehouse
         await update.callback_query.message.reply_text("Отправьте геопозицию места назначения (точка прибытия):")
@@ -304,8 +372,16 @@ async def save_trip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Построение маршрута по дорогам через ORS
     polyline_str = get_ors_route(start_point, end_point)
     if not polyline_str:
-        await update.message.reply_text("Не удалось построить маршрут. Проверьте API ключ и попробуйте позже.")
-        return ConversationHandler.END
+        # ИСПРАВЛЕНО: Вывод сообщения пользователю и логирование ошибки
+        logger.error(f"Failed to get ORS route for user {user_id} at {datetime.now()}. Check ORS_API_KEY and service status.")
+        # Спрашиваем пользователя, хочет ли он отправить багрепорт
+        keyboard = [
+            [InlineKeyboardButton("Да", callback_data='bug_report_yes')],
+            [InlineKeyboardButton("Нет", callback_data='bug_report_no')],
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text("Не удалось построить маршрут. Отправить багрепорт?", reply_markup=reply_markup)
+        return CONFIRM_BUG_REPORT # Переход к новому состоянию
 
     # ХОРОШИЙ СПОСОБ (используем json):
     import json
@@ -396,38 +472,56 @@ async def create_request_passenger(update: Update, context: ContextTypes.DEFAULT
     return ASK_TRIP_TYPE_PASSENGER
 
 async def ask_date_passenger(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Запрашивает дату запроса у пассажира с помощью кнопок."""
+    """Запрашивает дату запроса у пассажира с помощью кнопок (компактно)."""
     context.user_data['trip_type'] = update.callback_query.data.split('_')[1]
 
     keyboard = []
     today = datetime.today().date()
+    row = []
     for i in range(7):
         day = today + timedelta(days=i)
-        keyboard.append([InlineKeyboardButton(day.strftime('%Y-%m-%d'), callback_data=f'date_{day.strftime("%Y-%m-%d")}')])
+        row.append(InlineKeyboardButton(day.strftime('%d.%m'), callback_data=f'date_{day.strftime("%Y-%m-%d")}') )
+        if len(row) == 3: # 3 кнопки в строке
+            keyboard.append(row)
+            row = []
+    if row: # Добавить оставшиеся кнопки, если есть
+        keyboard.append(row)
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.callback_query.message.reply_text("Выберите дату поездки:", reply_markup=reply_markup)
     return ASK_DATE_PASSENGER
 
 async def ask_hour_passenger(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Запрашивает час запроса у пассажира с помощью кнопок."""
+    """Запрашивает час запроса у пассажира с помощью кнопок (компактно)."""
     selected_date = update.callback_query.data.split('_')[1]
     context.user_data['selected_date'] = selected_date
 
     keyboard = []
+    row = []
     for hour in range(24):
-        keyboard.append([InlineKeyboardButton(f'{hour:02d}:00', callback_data=f'hour_{hour:02d}')])
+        row.append(InlineKeyboardButton(f'{hour:02d}:00', callback_data=f'hour_{hour:02d}') )
+        if len(row) == 4: # 4 кнопки в строке
+            keyboard.append(row)
+            row = []
+    if row: # Добавить оставшиеся кнопки, если есть
+        keyboard.append(row)
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.callback_query.message.reply_text("Выберите час поездки:", reply_markup=reply_markup)
     return ASK_HOUR_PASSENGER
 
 async def ask_minute_passenger(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Запрашивает минуты запроса у пассажира с помощью кнопок."""
+    """Запрашивает минуты запроса у пассажира с помощью кнопок (компактно)."""
     selected_hour = update.callback_query.data.split('_')[1]
     context.user_data['selected_hour'] = selected_hour
 
     keyboard = []
+    row = []
     for minute in range(0, 60, 5): # Каждые 5 минут
-        keyboard.append([InlineKeyboardButton(f'{selected_hour}:{minute:02d}', callback_data=f'min_{minute:02d}')])
+        row.append(InlineKeyboardButton(f'{selected_hour}:{minute:02d}', callback_data=f'min_{minute:02d}') )
+        if len(row) == 4: # 4 кнопки в строке
+            keyboard.append(row)
+            row = []
+    if row: # Добавить оставшиеся кнопки, если есть
+        keyboard.append(row)
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.callback_query.message.reply_text("Выберите минуты поездки:", reply_markup=reply_markup)
     return ASK_MINUTE_PASSENGER
@@ -736,6 +830,28 @@ async def delete_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("Запрос не найден или вы не являетесь его владельцем.", show_alert=True)
     conn.close()
 
+# --- Обработчик багрепорта ---
+async def handle_bug_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает ответ на вопрос о багрепорте."""
+    query = update.callback_query
+    await query.answer()
+    choice = query.data.split('_')[2]
+
+    if choice == 'yes':
+        user_id = query.from_user.id
+        user_name = query.from_user.full_name
+        # Отправить сообщение разработчику
+        await context.bot.send_message(
+            chat_id=YOUR_ADMIN_USER_ID,
+            text=f"Багрепорт от пользователя {user_name} (ID: {user_id}) - Не удалось построить маршрут. Проверьте API ключ ORS и логи."
+        )
+        await query.edit_message_text("Багрепорт отправлен. Спасибо!")
+    else: # choice == 'no'
+        await query.edit_message_text("Багрепорт не отправлен.")
+
+    return ConversationHandler.END
+
+
 # --- Основная функция ---
 def main():
     """Запускает бота с вебхуками."""
@@ -753,6 +869,7 @@ def main():
             ASK_MINUTE_DRIVER: [CallbackQueryHandler(ask_location_driver)],
             ASK_LOCATION_DRIVER: [MessageHandler(filters.LOCATION, ask_seats)],
             ASK_SEATS: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_trip)],
+            CONFIRM_BUG_REPORT: [CallbackQueryHandler(handle_bug_report)], # Добавлено новое состояние
         },
         fallbacks=[],
     )
@@ -772,7 +889,12 @@ def main():
         fallbacks=[],
     )
 
+    # Добавляем обработчики команд
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("driver_menu", driver_menu))
+    application.add_handler(CommandHandler("passenger_menu", passenger_menu))
+    # application.add_handler(CommandHandler("switch_role", start)) # Если вдруг решите добавить позже
+
     application.add_handler(CallbackQueryHandler(handle_role_choice, pattern='^role_'))
     application.add_handler(conv_handler_driver)
     application.add_handler(conv_handler_passenger)
