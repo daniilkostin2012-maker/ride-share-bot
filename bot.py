@@ -104,19 +104,19 @@ def get_ors_route(start_coords, end_coords):
     # ORS API Documentation: https://openrouteservice.org/dev/#/api-docs/v2/directions/{profile}/post
     # Profile: driving-car, cycling-regular, foot-walking, etc.
     url = "https://api.openrouteservice.org/v2/directions/driving-car"
-    
+
     headers = {
         "Authorization": f"Bearer {ORS_API_KEY}",
         "Content-Type": "application/json",
     }
-    
+
     # Формат тела запроса для ORS: "coordinates": [[lon, lat], [lon, lat], ...]
     payload = {
         "coordinates": [
             [start_coords[1], start_coords[0]],  # [lon, lat]
             [end_coords[1], end_coords[0]]       # [lon, lat]
         ],
-        "format": "geojson", # Получаем ответ в формате GeoJSON
+        "format": "json", # ИСПРАВЛЕНО: Запрашиваем формат JSON, который возвращает 'routes'
         # "instructions": False, # Опционально: отключить инструкции для уменьшения ответа
         # "geometry_simplify": True # Опционально: упростить геометрию
     }
@@ -125,21 +125,22 @@ def get_ors_route(start_coords, end_coords):
         response = requests.post(url, json=payload, headers=headers)
         response.raise_for_status() # Вызовет исключение для кодов ошибок HTTP (4xx, 5xx)
         data = response.json()
-        
-        # Проверяем, есть ли маршрут в ответе
-        if 'features' in data and len(data['features']) > 0:
-            geometry = data['features'][0]['geometry']
-            if geometry['type'] == 'LineString':
-                coords = geometry['coordinates'] # coords = [[lon1, lat1], [lon2, lat2], ...]
-                # ORS возвращает [lon, lat], но наш код ожидает [lat, lon]
-                coords_lat_lon = [[lat, lon] for lon, lat in coords]
-                polyline_str = encode_coords_to_polyline(coords_lat_lon)
+
+        # ИСПРАВЛЕНО: Проверяем наличие 'routes' и первого маршрута
+        if 'routes' in data and len(data['routes']) > 0:
+            first_route = data['routes'][0]
+            # ИСПРАВЛЕНО: Получаем геометрию из 'geometry' первого маршрута
+            polyline_str = first_route.get('geometry')
+            if polyline_str:
+                # polyline.decode ожидает формат polyline6, что соответствует формату JSON
+                coords = polyline.decode(polyline_str) # coords = [[lat, lon], [lat, lon], ...]
+                # polyline_str уже закодирована правильно, возвращаем её
                 return polyline_str
             else:
-                logger.error(f"ORS API returned unexpected geometry type: {geometry['type']}")
+                logger.error(f"ORS API returned route but no geometry: {data}")
                 return None
         else:
-            logger.error(f"ORS API returned no features: {data}")
+            logger.error(f"ORS API returned no routes: {data}")
             return None
     except requests.exceptions.HTTPError as e:
         logger.error(f"HTTP error from ORS API: {e}")
