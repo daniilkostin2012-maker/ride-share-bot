@@ -17,6 +17,11 @@ from geopy.distance import geodesic
 import polyline
 import requests # Добавлено для API ORS
 
+# --- Скрытие предупреждений PTB для CallbackQueryHandler в ConversationHandler ---
+from warnings import filterwarnings
+from telegram.warnings import PTBUserWarning
+filterwarnings(action="ignore", message=r".*CallbackQueryHandler", category=PTBUserWarning)
+
 # --- Настройки ---
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN") # Получить из переменных окружения на Render
 ORS_API_KEY = os.environ.get("ORS_API_KEY") # Получить из переменных окружения на Render
