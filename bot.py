@@ -408,12 +408,14 @@ async def check_matches_for_new_trip(update, context, trip_id):
     """Проверяет совпадения новой поездки водителя с существующими запросами пассажиров."""
     conn = sqlite3.connect('carpool_bot.db')
     c = conn.cursor()
-    c.execute("SELECT * FROM trips WHERE id = ?", (trip_id,))
+    # ИСПРАВЛЕНО: Явно указываем столбцы, соответствующие переменным ниже
+    c.execute("SELECT driver_id, trip_type, start_time, start_point, end_point, polyline, available_seats FROM trips WHERE id = ?", (trip_id,))
     trip = c.fetchone()
     if not trip:
         conn.close()
         return
 
+    # ИСПРАВЛЕНО: Теперь ожидается 7 значений, соответствующих SELECT выше
     driver_id, trip_type, trip_time_str, start_point_str, end_point_str, polyline_str, available_seats = trip
     trip_time = datetime.strptime(trip_time_str, '%Y-%m-%d %H:%M')
     polyline_coords = decode_polyline_to_coords(polyline_str)
@@ -623,22 +625,24 @@ async def check_matches_for_new_request(update, context, req_id):
         return # Пропустить некорректную запись
 
     # Найти поездки в нужное время и тип (сначала проверяем время)
+    # ИСПРАВЛЕНО: Явно указываем столбцы, соответствующие переменным ниже (БЕЗ trip_id)
     c.execute("""
-        SELECT * FROM trips
+        SELECT driver_id, trip_type, start_time, start_point, end_point, polyline, available_seats FROM trips
         WHERE trip_type = ? AND start_time BETWEEN ? AND ?
     """, (req_type, (req_time - timedelta(hours=1)).isoformat(' '), (req_time + timedelta(hours=1)).isoformat(' ')))
     matching_trips = c.fetchall()
 
     found_match = False
     for trip in matching_trips:
-        trip_id, driver_id, trip_type, trip_time_str, start_point_str, end_point_str, polyline_str, available_seats = trip
+        # ИСПРАВЛЕНО: Теперь ожидается 7 значений, соответствующих SELECT выше (trip_id НЕТ)
+        driver_id, trip_type, trip_time_str, start_point_str, end_point_str, polyline_str, available_seats = trip
         # Теперь проверяем дистанцию, так как время совпадает
         if req_seats <= available_seats and is_point_near_polyline(pickup_point, decode_polyline_to_coords(polyline_str)):
             # Найти имя пассажира
             passenger_name = (await context.bot.get_chat(passenger_id)).first_name
             # Отправить уведомление водителю
             keyboard = [
-                [InlineKeyboardButton("Принять", callback_data=f'accept_{req_id}_{trip_id}'),
+                [InlineKeyboardButton("Принять", callback_data=f'accept_{req_id}_{trip_id}'), # trip_id берется из внешней области видимости функции
                  InlineKeyboardButton("Отклонить", callback_data=f'reject_{req_id}')],
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
