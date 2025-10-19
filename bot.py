@@ -779,7 +779,7 @@ def main():
     application.add_handler(CallbackQueryHandler(delete_request, pattern='^delete_request_'))
 
     # Запуск через вебхуки
-    port = int(os.environ.get('PORT', 8443))  # Render предоставляет PORT
+    port = int(os.environ.get('PORT', 10000))  # Render предоставляет PORT
     application.run_webhook(
         listen="0.0.0.0",
         port=port,
